@@ -5,3 +5,4 @@ data/live/
 *.mp3
 .env
 __pycache__/
+runs/
