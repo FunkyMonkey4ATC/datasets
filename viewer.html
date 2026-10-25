@@ -1,0 +1,253 @@
+<!doctype html>
+<!-- Ground Truth replay viewer. No dependencies, works offline.
+     From the FunkyMonkey folder:  python -m http.server 8000   then open  http://localhost:8000/viewer.html
+     Space: play/pause. Left/Right: -10 s / +10 s. Click the timeline to seek. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ground Truth Replay</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --dim:#8b949e;
+          --twr:#39c5cf; --gnd:#e3b341; --veh:#f0883e; --alert:#f85149; --ok:#3fb950; --rwy:#3a4250; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:13px/1.4 ui-monospace, Consolas, monospace; }
+  header { display:flex; gap:10px; align-items:center; padding:8px 12px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header select, header button { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:4px; padding:4px 8px; font:inherit; }
+  header button { cursor:pointer; min-width:70px; }
+  #clock { font-size:15px; }
+  #timeline { display:block; width:100%; height:34px; cursor:pointer; border-bottom:1px solid var(--line); }
+  main { display:grid; grid-template-columns:1fr 380px; gap:8px; padding:8px; height:calc(100vh - 86px); }
+  .left { display:grid; grid-template-rows:1fr 90px 90px; gap:8px; min-height:0; }
+  .right { display:flex; flex-direction:column; gap:8px; min-height:0; }
+  .box { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px; min-height:0; position:relative; }
+  .box h2 { margin:0 0 6px; font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+  canvas.fill { display:block; width:100%; height:100%; }
+  .wave h2 { position:absolute; top:6px; left:10px; z-index:1; }
+  .wave label { position:absolute; top:4px; right:10px; z-index:1; color:var(--dim); }
+  #log { overflow:auto; flex:1; }
+  #log div { padding:2px 0; border-bottom:1px solid #21262d; }
+  #log .now { background:#1f2a37; }
+  .tag { display:inline-block; width:30px; font-weight:700; }
+  .t-tower { color:var(--twr); } .t-ground { color:var(--gnd); }
+  .badge { display:inline-block; padding:1px 6px; border-radius:3px; font-weight:700; color:#0d1117; }
+  .VFR { background:var(--ok); } .MVFR { background:#58a6ff; } .IFR { background:var(--alert); } .LIFR { background:#d2a8ff; }
+  #wx .raw { color:var(--dim); word-break:break-all; margin-top:4px; }
+  #key .a { padding:3px 0; } #key .due { color:var(--alert); font-weight:700; }
+  #err { color:var(--alert); }
+  @media (max-width: 900px) { main { grid-template-columns:1fr; height:auto; } .left { grid-template-rows:420px 90px 90px; } }
+</style>
+</head>
+<body>
+<header>
+  <select id="pick"></select>
+  <button id="play">Play</button>
+  <span id="clock">--:--:--Z</span>
+  <span id="title" style="color:var(--dim)"></span>
+  <span id="err"></span>
+</header>
+<canvas id="timeline"></canvas>
+<main>
+  <div class="left">
+    <div class="box"><canvas id="map" class="fill"></canvas></div>
+    <div class="box wave"><h2 class="t-tower">Tower</h2><label><input type="checkbox" id="m-tower" checked> audio</label><canvas id="w-tower" class="fill"></canvas></div>
+    <div class="box wave"><h2 class="t-ground">Ground</h2><label><input type="checkbox" id="m-ground" checked> audio</label><canvas id="w-ground" class="fill"></canvas></div>
+  </div>
+  <div class="right">
+    <div class="box" id="wx"><h2>Weather (as received from the API)</h2><div id="wxbody">–</div></div>
+    <div class="box" style="flex:1;display:flex;flex-direction:column"><h2>Radio</h2><div id="log"></div></div>
+    <div class="box" id="key"><h2><label><input type="checkbox" id="showkey" checked> Answer key</label></h2><div id="keybody"></div></div>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const CH = ["tower", "ground"], COL = { tower: "#39c5cf", ground: "#e3b341" };
+const WIN_PAST = 30, WIN_FUTURE = 10, PEAKS_PER_S = 100;
+let S = null, actx = null, gains = {}, srcs = [], t0 = 0, offset = 0, playing = false, lastPanel = "";
+
+const jl = async u => (await (await fetch(u)).text()).trim().split("\n").filter(Boolean).map(JSON.parse);
+const hhmmss = ms => new Date(ms).toISOString().slice(11, 19) + "Z";
+
+function peaks(data, rate) {  // max |amplitude| per 10 ms
+  const step = rate / PEAKS_PER_S, out = new Float32Array(Math.ceil(data.length / step));
+  for (let i = 0; i < out.length; i++) {
+    let m = 0;
+    for (let j = Math.floor(i * step), e = Math.min(data.length, Math.floor((i + 1) * step)); j < e; j++) m = Math.max(m, Math.abs(data[j]));
+    out[i] = m;
+  }
+  return out;
+}
+
+async function load(id) {
+  stop(); offset = 0; $("#err").textContent = ""; location.hash = id;
+  const b = `data/sim/${id}/`;
+  const [exp, ap, tx, tr, wx] = await Promise.all([
+    fetch(b + "expected.json").then(r => r.json()), fetch(b + "airport.json").then(r => r.json()),
+    jl(b + "transmissions.jsonl"), jl(b + "tracks.jsonl"), jl(b + "weather.jsonl")]);
+  const start = Date.parse(exp.start), sec = iso => (Date.parse(iso) - start) / 1000;
+  const lat0 = ap.center[0], lon0 = ap.center[1], kx = 111320 * Math.cos(lat0 * Math.PI / 180);
+  const xy = ([lat, lon]) => [(lon - lon0) * kx, (lat - lat0) * 111320];
+  const tracks = {};
+  for (const r of tr) (tracks[r.id] ||= []).push({ ...r, s: sec(r.t), p: xy([r.lat, r.lon]) });
+  const rwys = Object.entries(ap.runways).map(([k, v]) => ({ k, p: v.map(xy) }));
+  const all = rwys.flatMap(r => r.p);
+  const M = 1500;  // metres around the runways, so short final and the climb-out are on screen
+  const bounds = [Math.min(...all.map(p => p[0])) - M, Math.max(...all.map(p => p[0])) + M, Math.min(...all.map(p => p[1])) - M, Math.max(...all.map(p => p[1])) + M];
+  actx ||= new AudioContext();
+  const bufs = {}, pk = {};
+  for (const f of CH) {
+    bufs[f] = await actx.decodeAudioData(await (await fetch(b + f + ".wav")).arrayBuffer());
+    pk[f] = peaks(bufs[f].getChannelData(0), bufs[f].sampleRate);
+    if (!gains[f]) { gains[f] = actx.createGain(); gains[f].connect(actx.destination); }
+  }
+  S = { exp, start, dur: (Date.parse(exp.end) - start) / 1000, bufs, pk, tracks, bounds, rwys,
+        twys: Object.values(ap.taxiways).flat().map(l => l.map(xy)),
+        tx: tx.map(r => ({ ...r, s: sec(r.t), e: sec(r.t_end) })),
+        wx: wx.map(r => ({ ...r, s: sec(r.api ? r.api.receiptTime : r.t) })).sort((a, b) => a.s - b.s),
+        alerts: exp.expected_alerts.map(a => ({ ...a, s: sec(a.cue), d: sec(a.detect_by) })),
+        event: exp.event && { ...exp.event, s: sec(exp.event.t) } };
+  $("#title").textContent = `${exp.airport} · ${exp.title}`;
+  lastPanel = "";
+}
+
+const now = () => playing ? actx.currentTime - t0 : offset;
+function play() {
+  if (playing || !S) return;
+  actx.resume();
+  srcs = CH.map(f => { const n = actx.createBufferSource(); n.buffer = S.bufs[f]; n.connect(gains[f]); n.start(0, offset); return n; });
+  t0 = actx.currentTime - offset; playing = true; $("#play").textContent = "Pause";
+}
+function stop() {
+  if (!playing) return;
+  offset = now(); srcs.forEach(n => n.stop()); srcs = []; playing = false; $("#play").textContent = "Play";
+}
+function seek(t) { const p = playing; stop(); offset = Math.max(0, Math.min(t, S.dur - 0.1)); if (p) play(); }
+
+function sizeCanvas(c) {
+  const r = devicePixelRatio || 1, w = c.clientWidth * r, h = c.clientHeight * r;
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  const g = c.getContext("2d"); g.setTransform(r, 0, 0, r, 0, 0);
+  return [g, c.clientWidth, c.clientHeight];
+}
+
+function at(rows, t) {  // interpolated track state at time t, or null when not present
+  if (!rows.length || t < rows[0].s || t > rows[rows.length - 1].s + 1) return null;
+  let lo = 0, hi = rows.length - 1;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (rows[m].s <= t) lo = m; else hi = m - 1; }
+  const a = rows[lo], b = rows[Math.min(lo + 1, rows.length - 1)], f = b.s > a.s ? Math.min(1, (t - a.s) / (b.s - a.s)) : 0;
+  return { ...a, i: lo, p: [a.p[0] + (b.p[0] - a.p[0]) * f, a.p[1] + (b.p[1] - a.p[1]) * f] };
+}
+
+function drawMap(t) {
+  const [g, W, H] = sizeCanvas($("#map"));
+  g.clearRect(0, 0, W, H);
+  const [x0, x1, y0, y1] = S.bounds, pad = 1;
+  const k = Math.min(W / ((x1 - x0) * pad), H / ((y1 - y0) * pad)), cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+  const P = p => [W / 2 + (p[0] - cx) * k, H / 2 - (p[1] - cy) * k];
+  g.lineCap = "round";
+  g.strokeStyle = "#262c36"; g.lineWidth = Math.max(1, 20 * k);
+  for (const l of S.twys) { g.beginPath(); l.forEach((p, i) => g[i ? "lineTo" : "moveTo"](...P(p))); g.stroke(); }
+  g.strokeStyle = "#3a4250"; g.lineWidth = Math.max(3, 45 * k);
+  for (const r of S.rwys) { g.beginPath(); r.p.forEach((p, i) => g[i ? "lineTo" : "moveTo"](...P(p))); g.stroke(); }
+  g.fillStyle = "#8b949e"; g.font = "11px ui-monospace, monospace";
+  for (const r of S.rwys) { const [a, b] = [P(r.p[0]), P(r.p[1])]; g.fillText(r.k, (a[0] + b[0]) / 2 + 8, (a[1] + b[1]) / 2 - 8); }
+  for (const rows of Object.values(S.tracks)) {
+    const s = at(rows, t);
+    if (!s) continue;
+    const veh = s.kind === "vehicle", col = veh ? "#f0883e" : s.on_ground ? "#e6edf3" : "#58a6ff";
+    g.strokeStyle = col + "55"; g.lineWidth = 2; g.beginPath();  // 20 s trail
+    for (let i = Math.max(0, s.i - 20); i <= s.i; i++) g[i === Math.max(0, s.i - 20) ? "moveTo" : "lineTo"](...P(rows[i].p));
+    g.lineTo(...P(s.p)); g.stroke();
+    const [sx, sy] = P(s.p);
+    g.save(); g.translate(sx, sy); g.rotate(s.heading * Math.PI / 180); g.fillStyle = col; g.beginPath();
+    if (veh) g.rect(-4, -4, 8, 8); else { g.moveTo(0, -8); g.lineTo(5, 6); g.lineTo(0, 3); g.lineTo(-5, 6); g.closePath(); }
+    g.fill(); g.restore();
+    g.fillStyle = col;
+    g.fillText(`${s.callsign || s.id}${s.source === "recorded" ? " ●rec" : ""}`, sx + 9, sy - 4);
+    g.fillStyle = "#8b949e"; g.fillText(`${Math.round(s.speed_kt)} kt${s.on_ground ? "" : " air"}`, sx + 9, sy + 9);
+  }
+  if (S.event && Math.abs(t - S.event.s) < 4) { g.fillStyle = "#f85149"; g.font = "bold 14px ui-monospace, monospace"; g.fillText(S.event.what, 12, H - 14); }
+}
+
+function drawWave(f, t) {
+  const [g, W, H] = sizeCanvas($("#w-" + f)), pk = S.pk[f], span = WIN_PAST + WIN_FUTURE, mid = H / 2 + 6;
+  g.clearRect(0, 0, W, H);
+  const xOf = s => (s - (t - WIN_PAST)) / span * W;
+  for (const x of S.tx) if (x.freq === f && x.e > t - WIN_PAST && x.s < t + WIN_FUTURE) {  // shade each transmission
+    g.fillStyle = x.s <= t && t <= x.e ? "#ffffff14" : "#ffffff08";
+    g.fillRect(xOf(x.s), 0, xOf(x.e) - xOf(x.s), H);
+    g.fillStyle = "#8b949e"; g.font = "10px ui-monospace, monospace";
+    g.fillText(x.text.slice(0, Math.max(0, Math.floor((xOf(x.e) - xOf(x.s)) / 6))), xOf(x.s) + 3, H - 4);
+  }
+  for (let px = 0; px < W; px++) {
+    const s = t - WIN_PAST + px / W * span, i = Math.floor(s * PEAKS_PER_S);
+    const a = i >= 0 && i < pk.length ? pk[i] : 0, h = Math.max(0.5, a * (H - 26));
+    g.fillStyle = s <= t ? COL[f] : COL[f] + "40";
+    g.fillRect(px, mid - h / 2, 1, h);
+  }
+  g.fillStyle = "#e6edf3"; g.fillRect(xOf(t), 0, 1, H);
+}
+
+function drawTimeline(t) {
+  const [g, W, H] = sizeCanvas($("#timeline")), X = s => s / S.dur * W;
+  g.fillStyle = "#0d1117"; g.fillRect(0, 0, W, H);
+  CH.forEach((f, j) => { g.fillStyle = COL[f] + "aa"; for (const x of S.tx) if (x.freq === f) g.fillRect(X(x.s), 6 + j * 11, Math.max(1, X(x.e) - X(x.s)), 8); });
+  if ($("#showkey").checked) for (const a of S.alerts) { g.fillStyle = "#f85149"; g.fillRect(X(a.s) - 1, 0, 3, H); }
+  if (S.event) { g.fillStyle = "#ffffff"; g.fillRect(X(S.event.s) - 1, 0, 3, H); }
+  g.fillStyle = "#58a6ff"; g.fillRect(X(t) - 1, 0, 2, H);
+}
+
+function panels(t) {
+  const txNow = S.tx.filter(x => x.s <= t), wx = S.wx.filter(w => w.s <= t).pop();
+  const key = `${txNow.length}|${S.tx.findIndex(x => x.s <= t && t <= x.e)}|${wx && wx.s}|${S.alerts.filter(a => a.s <= t).length}|${$("#showkey").checked}`;
+  if (key === lastPanel) return;
+  lastPanel = key;
+  $("#log").innerHTML = txNow.slice(-14).reverse().map(x =>
+    `<div class="${x.s <= t && t <= x.e ? "now" : ""}"><span class="tag t-${x.freq}">${x.freq === "tower" ? "TWR" : "GND"}</span>` +
+    `<span style="color:var(--dim)">${hhmmss(S.start + x.s * 1000)}</span> ${x.text}</div>`).join("");
+  if (wx) {
+    const a = wx.api || {};
+    $("#wxbody").innerHTML = `<span class="badge ${a.fltCat || ""}">${a.fltCat || "?"}</span> ${a.metarType || ""} ` +
+      `<b>${wx.wind_dir == null ? "" : String(wx.wind_dir).padStart(3, "0")}° ${wx.wind_kt} kt${wx.gust_kt ? " G" + wx.gust_kt : ""}</b>` +
+      ` &nbsp;vis ${wx.visibility_sm} SM &nbsp;ceiling ${wx.ceiling_ft ? wx.ceiling_ft + " ft" : "none"}` +
+      `<div class="raw">${wx.metar}</div><div style="color:var(--dim)">received ${hhmmss(S.start + wx.s * 1000)}</div>`;
+  } else $("#wxbody").textContent = "no report received yet";
+  $("#keybody").innerHTML = !$("#showkey").checked ? "hidden" : S.alerts.length ? S.alerts.map(a =>
+    `<div class="a ${a.s <= t ? "due" : ""}">${hhmmss(S.start + a.s * 1000)} ${a.rule} (rwy ${a.runway})` +
+    `${a.lead_time_s ? `, ${a.lead_time_s} s before impact` : ""}<br><span style="color:var(--dim)">${a.why}</span></div>`).join("")
+    : `<div class="a" style="color:var(--ok)">No alert expected. Any alert here is a false alarm.</div>`;
+}
+
+function frame() {
+  if (S) {
+    let t = now();
+    if (t >= S.dur) { stop(); offset = S.dur; t = S.dur; }
+    $("#clock").textContent = `${hhmmss(S.start + t * 1000)}  T+${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+    drawTimeline(t); drawMap(t); CH.forEach(f => drawWave(f, t)); panels(t);
+  }
+  requestAnimationFrame(frame);
+}
+
+$("#play").onclick = () => playing ? stop() : play();
+$("#pick").onchange = e => load(e.target.value).catch(err => $("#err").textContent = err);
+addEventListener("hashchange", () => { const id = decodeURIComponent(location.hash.slice(1)); if (id && (!S || S.exp.id !== id)) { $("#pick").value = id; load(id); } });
+$("#timeline").onclick = e => S && seek(e.offsetX / e.target.clientWidth * S.dur);
+CH.forEach(f => $("#m-" + f).onchange = e => gains[f] && (gains[f].gain.value = e.target.checked ? 1 : 0));
+addEventListener("keydown", e => {
+  if (!S || e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); playing ? stop() : play(); }
+  if (e.code === "ArrowRight") seek(now() + 10);
+  if (e.code === "ArrowLeft") seek(now() - 10);
+});
+
+fetch("data/sim/index.json").then(r => r.json()).then(index => {
+  $("#pick").innerHTML = index.map(s => `<option value="${s.id}">${s.airport} · ${s.kind === "nominal" ? "✓" : "!"} ${s.title}</option>`).join("");
+  const id = decodeURIComponent(location.hash.slice(1)) || index[0].id;
+  $("#pick").value = id;
+  return load(id);
+}).catch(err => $("#err").textContent = "Serve this folder: python -m http.server 8000 (" + err + ")");
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

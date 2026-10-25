@@ -1,0 +1,7 @@
+# Generated: rebuild with simulate.py and feed.py
+data/sim/
+# Raw live recordings: OpenSky and LiveATC terms do not allow redistribution
+data/live/
+*.mp3
+.env
+__pycache__/
