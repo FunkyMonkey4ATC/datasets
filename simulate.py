@@ -268,6 +268,9 @@ class ElevenLabs:
             s.key = next((l.split("=", 1)[1].strip() for l in env.read_text().splitlines() if l.startswith("ELEVENLABS_API_KEY=")), None)
         if not s.key:
             raise SystemExit("--voices eleven needs ELEVENLABS_API_KEY in the environment or in .env next to simulate.py")
+        sub = json.loads(s._req("/user/subscription"))  # never spend past what the plan has left
+        s.budget = min(budget, sub["character_limit"] - sub["character_count"])
+        print(f"ElevenLabs {sub.get('tier')} plan: {sub['character_limit'] - sub['character_count']} characters left; this run spends at most {s.budget}")
         vf = cache / "voices.json"
         if not vf.exists():
             vf.write_bytes(s._req("/voices"))
@@ -325,7 +328,7 @@ class Track:
     def __init__(s, sim, kind, call, spoken, speaker):
         s.kind, s.call, s.sp, s.speaker = kind, call, spoken, speaker
         s.id = f"{sim.rng.integers(0xA00000, 0xAFFFFF):06x}" if kind == "aircraft" else f"veh-{sim.rng.integers(0, 0xFFFF):04x}"
-        s.voice = sim.tts.pilot_voice(sim.rng)
+        s.voice = sim.tts.pilot_voice(sim.vrng)
         s.pts, s.recorded_until = [], -math.inf
         sim.tracks.append(s)
 
@@ -388,6 +391,7 @@ class Sim:
     def __init__(s, sid, kind, title, summary, base, seed, tts):
         s.sid, s.kind, s.title, s.summary, s.base, s.tts = sid, kind, title, summary, base, tts
         s.rng = np.random.default_rng(seed)
+        s.vrng = np.random.default_rng(seed + 10_000)  # voices draw separately, so the scenario is the same with either voice engine
         s.tracks, s.tx, s.wx = [], {TWR: [], GND: []}, [(0, dict(AP["wx"]))]
         s.alerts, s.notes, s.event, s.used = [], [], None, set()
         s.reports, s.wx_source = None, "simulated"  # reports: [(t, "METAR"|"SPECI")]; None = routine + one SPECI per change
@@ -561,6 +565,7 @@ class Sim:
             assert t < a.T - 25, f"{s.sid}: landing clearance for {a.call} would be too late"
             s.land(a, t)
             if deps and k + 1 < n:
+                mark = len(s.tracks), {f: len(ch) for f, ch in s.tx.items()}
                 if dep_rwy == AP["arr"]:  # single runway
                     d = s.taxi_out(a.clear + 5, rwy=dep_rwy, cross=None)
                     s.take_off(d, a.clear + 3)
@@ -570,6 +575,11 @@ class Sim:
                     s.cross_rwy(d, a.clear + 10)
                     free = d.cross_done
                     s.take_off(d, arrs[k + 1].clear + 3)
+                if free + 2 >= arrs[k + 1].T - 25:  # speech ran long: hold this departure, as a controller would
+                    del s.tracks[mark[0]:]
+                    for f, ch in s.tx.items():
+                        del ch[mark[1][f]:]
+                    free = None
         return arrs
 
     def expect(s, rule, cue, runway, parties, why, slack=3):
@@ -905,8 +915,9 @@ def main(args):
             print(json.dumps(index[-1]), flush=True)
     if isinstance(tts, ElevenLabs):
         print(f"ElevenLabs characters spent this run: {tts.spent}")
-    if not rest:
-        (OUT / "index.json").write_text(json.dumps(index, indent=2))
+    ix = OUT / "index.json"  # merge, so a partial run keeps the other scenarios listed for the viewer
+    keep = [e for e in (json.loads(ix.read_text()) if ix.exists() else []) if e["id"] not in {e["id"] for e in index}]
+    ix.write_text(json.dumps(sorted(keep + index, key=lambda e: e["id"]), indent=2))
 
 
 if __name__ == "__main__":
